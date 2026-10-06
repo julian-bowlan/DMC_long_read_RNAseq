@@ -1,0 +1,7 @@
+buckets:
+    - bucket_uri: gs://em52-us-depmap-src-restr-prod-6f04/data/DMC_26Q1
+      mount_path: $HOME/Projects/DMC_long_read_RNAseq/data/DMC_26Q1
+      
+    - bucket_uri: gs://em52-us-depmap-src-restr-prod-6f04/data/Olink_26Q1
+      mount_path: $HOME/Projects/DMC_long_read_RNAseq/data/Olink_26Q1
+      

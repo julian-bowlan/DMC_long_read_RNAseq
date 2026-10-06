@@ -1,0 +1,1443 @@
+`---
+title: "Analysis of DMC 25Q3 long-read RNA-seq data"
+
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      knit_root_dir = here::here(),
+      output_dir = 'out',
+      output_file = paste0(xfun::sans_ext(basename(input)), '_', format(Sys.Date(),format="%d%b%Y"), '.html'),
+      envir = globalenv()
+    )
+  })
+
+output: 
+  html_document: 
+    code_download: yes
+    date: "`r format(Sys.time(), '%d-%B-%Y, %H:%M:%S %Z')`"
+    toc: yes
+    toc_float: yes
+    fig_width: 10
+    fig_height: 10
+    fig_caption: yes
+    number_sections: yes
+---
+
+```{r setup, include=FALSE}
+
+# set up output html figures to be in SVG format
+# set up current working directory to be the project directory
+knitr::opts_chunk$set(echo = TRUE,dev='svg',root.dir = rprojroot::find_rstudio_root_file())
+date.stamp <- format(Sys.Date(),format="%d%b%Y")
+print(rprojroot::find_rstudio_root_file())
+knitr::opts_knit$set(root.dir=rprojroot::find_rstudio_root_file())
+
+# THIS NEEDS TO BE EDITED
+this.analysis <- "analyze_DMC_25Q3_long_read_RNAseq"
+
+# output files will be prefixed with this.analysis and placed in the "out" folder
+filestamp <- function(x) {
+  paste0('out/',this.analysis,"_",xfun::sans_ext(x),"_", format(Sys.Date(),format="%d%b%Y"), ".",xfun::file_ext(x))
+}
+
+# Functions to get date and time
+getDate <- function() format(Sys.Date(), "%Y%m%d")
+getTime <- function() format(Sys.time(), "%H:%M:%S")
+
+# copy snapshot of this Rmd to output folder
+this.rmd <- knitr::current_input()
+if(!is.null(this.rmd)) {
+system(paste0("cp src/",
+              this.rmd,
+              " ",
+              paste0("out/",xfun::sans_ext(this.rmd),'_',format(Sys.Date(),format="%d%b%Y"),".",xfun::file_ext(this.rmd))
+))
+}
+
+```
+
+## Load libraries
+
+```{r}
+
+library(tidyverse)
+library(magrittr)
+library(readxl)
+library(RColorBrewer)
+library(ggsci)
+library(ggrepel)
+# library(bigrquery)
+# library(DBI)
+library(BiocManager)
+library(rtracklayer)
+library(biomaRt)
+library(data.table)
+library(edgeR)
+library(limma)
+library(conflicted)
+
+conflict_prefer_all("dplyr", quiet = TRUE)
+
+```
+
+## Configuration
+
+```{r}
+
+# I/O
+depmapDataDir <- file.path("data", "DMC_26Q1")
+olinkDataDir <- file.path("data", "Olink_26Q1")
+projDir <- file.path("~/Projects/DMC_long_read_RNAseq")
+gtfDir <- file.path(projDir, "out", "filtered_GTF_files")
+analysis_outdir <- file.path(projDir, "out", this.analysis)
+outdir <- file.path(analysis_outdir, getDate())
+volPlotDir <- file.path(outdir, "volcano_plots")
+boxplotDir <- file.path(outdir, "boxplots")
+
+if(!dir.exists(gtfDir)) dir.create(gtfDir, recursive = TRUE)
+if(!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+if(!dir.exists(volPlotDir)) dir.create(volPlotDir, recursive = TRUE)
+if(!dir.exists(boxplotDir)) dir.create(boxplotDir, recursive = TRUE)
+
+if(length(list.files(depmapDataDir)) <= 1) system("axe-cloud-fuser mount --path buckets.yaml")
+
+```
+
+## Generate table of canonical transcripts from Ensembl Biomart
+
+```{r}
+
+txp_annot_file <- file.path(projDir, "data","ensembl_transcript_annotation.txt")
+
+if(!file.exists(txp_annot_file))
+{
+  # Get table from biomaRt for converting outdated gene names
+  mart <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+  
+  txp_annot <- getBM(attributes = c("uniprotswissprot",
+                                    "hgnc_symbol",
+                                    "ensembl_gene_id",
+                                    # "entrezgene_id",
+                                    # "external_gene_name",
+                                    # "external_synonym",
+                                    "ensembl_transcript_id",
+                                    "transcript_is_canonical"),
+                      mart = mart) %>%
+                mutate(transcript_is_canonical = case_when(transcript_is_canonical == 1 ~ TRUE, .default = FALSE))
+
+  write_tsv(txp_annot, txp_annot_file)
+} else {
+  txp_annot <- read_tsv(txp_annot_file) %>% as.data.frame()
+}
+
+# Get gene annotation
+gene_annot <- txp_annot %>%
+              group_by(uniprotswissprot, hgnc_symbol, ensembl_gene_id, entrezgene_id) %>%
+              summarise() %>%
+              ungroup() %>%
+              as.data.frame()
+
+```
+
+## Load surface protein annotations
+
+```{r}
+
+gene_prot_annot <- read_tsv(file.path("data", "gene_protein_annotation.txt"), name_repair = "universal_quiet") %>%
+                   group_by(UniProtKB.Swiss.Prot.ID, HGNC.symbol) %>%
+                   summarise() %>%
+                   ungroup() %>%
+                   filter(!is.na(UniProtKB.Swiss.Prot.ID) & !is.na(HGNC.symbol)) %>%
+                   as.data.frame()
+
+## Cell surface protein atlas ##
+
+cspa <- read_excel(file.path("data", "CSPA_validated_cell_surface_proteins.xlsx"), sheet = "Table A", .name_repair = "universal_quiet") %>%
+        filter(organism == "Human" & CSPA.category == "1 - high confidence") %>%
+        group_by(ID_link, ENTREZ_gene_ID, ENTREZ.gene.symbol, protein.probability, UniProt.Cell.surface) %>%
+        summarise() %>%
+        ungroup() %>%
+        as.data.frame()
+
+miss_cspa <- cspa %>% filter(!ENTREZ.gene.symbol %in% gene_annot$HGNC.symbol) %>%
+                      left_join(select(gene_annot, ID_link = uniprotswissprot, hgnc_symbol), by = "ID_link") %>%
+                      mutate(ENTREZ.gene.symbol = case_when(!is.na(hgnc_symbol) ~ hgnc_symbol, .default = ENTREZ.gene.symbol)) %>%
+                      select(-hgnc_symbol)
+
+cspa %<>% filter(!ENTREZ_gene_ID %in% miss_cspa$ENTREZ_gene_ID) %>%
+          bind_rows(miss_cspa)
+
+## Ensembl cell membrane/surface proteins ##
+
+uniprot_annot <- read_tsv(file.path("data", "uniprot_surface_membrane.tsv")) %>%
+                  filter(!grepl("secreted", `Subcellular location [CC]`, ignore.case = TRUE)) %>%
+                  filter(!grepl("endoplasmic reticulum|golgi|mitochondrion|lysosome", `Subcellular location [CC]`, ignore.case = TRUE)) %>%
+                  filter(grepl("extracellular", `Topological domain`, ignore.case = TRUE)) %>%
+                  separate_longer_delim(`Gene Names`, delim = " ") %>%
+                  as.data.frame()
+
+## Bausch, Fluck et al surface proteins ##
+
+bf_annot <- read_excel(file.path("data", "bausch_fluck_surfaceome.xlsx"), sheet = 2, skip = 1) %>%
+            select(`UniProt name`, `UniProt accession`, `UniProt gene`, `Surfaceome Label`, length, `TM domains`, signalpeptide, `Ensembl gene`) %>%
+            as.data.frame()
+
+```
+
+## Load DMC 26Q1 long-read RNA-seq data
+
+```{r}
+
+lr_exp_file <- file.path(depmapDataDir, "OmicsLongReadExpressionTranscriptlogp1HumanAllGenesPlusNovel.csv")
+lr_count_file <- file.path(depmapDataDir, "OmicsLongReadExpressionTranscriptRawReadCountHumanAllGenesPlusNovel.csv")
+lr_gtf_file <- file.path(depmapDataDir, "OmicsLongReadGTF.gtf")
+lr_exp_outfile <- file.path(projDir, "out", this.analysis, "longread_RNAseq_novel_isoforms_log2TPM.txt")
+lr_gtf_outfile <- file.path(projDir, "out", this.analysis, "longread_RNAseq_transcripts.gtf")
+lr_gtf_exons_outfile<- file.path(projDir, "out", this.analysis, "longread_RNAseq_transcripts_and_exons.gtf")
+novel_surf_gtf_outfile <- file.path(projDir, "out", this.analysis, "longread_RNAseq_novel_surfaceome_isoforms.gtf")
+surf_gtf_outfile <- file.path(projDir, "out", this.analysis, "longread_RNAseq_all_surfaceome_isoforms.gtf")
+
+# Read metadata and filter for AML cell lines
+all_mtdt <- read_csv(file.path(depmapDataDir, "Model.csv")) %>% as.data.frame()
+
+# if(!file.exists(lr_dat_outfile))
+# {
+#   # Load only first 2 rows of data to get column names for novel isoforms
+  # lr_exp <- fread(lr_dat_file, nrows = 2)
+  # COI <- grep("TCON", colnames(lr_exp))
+  # rm(lr_exp)
+#   
+#   # Use fread from data.table to only read desired rows and columns
+#   # lr_exp_gawk_cmd <- paste0("gawk 'BEGIN {FS=\",\"} {if(NR == 1 || $3 ~ /", paste(unique(AML_mtdt$ModelID), collapse = "|"), "/) {print $0}}' ", lr_dat_file)
+#   # lr_exp <- as.data.frame(fread(cmd = lr_exp_gawk_cmd, select = c(3, 5, COI))) %>%
+#   lr_exp <- as.data.frame(fread(lr_dat_file, select = c(3, 5, COI))) %>%
+#             filter(IsDefaultEntryForModel == "Yes") %>%
+#             select(-IsDefaultEntryForModel)
+#   
+#   write_tsv(lr_exp, lr_dat_outfile)
+# } else {
+#   lr_exp <- read_tsv(lr_dat_outfile)
+# }
+
+## Load log2TPM data and convert to TPM ##
+
+lr_exp <- as.data.frame(fread(lr_exp_file)) %>%
+          filter(IsDefaultEntryForModel == "Yes") %>%
+          select(-V1, -SequencingID, -ModelConditionID, -IsDefaultEntryForModel, -IsDefaultEntryForMC)
+
+invisible(gc())
+
+# Convert data to gene x model matrix
+expr_mat_log <- lr_exp %>%
+                column_to_rownames(var = "ModelID") %>%
+                t()
+
+# Create table with linear TPM data
+expr_mat_tpm <- 2^expr_mat_log - 1
+expr_mat_tpm[expr_mat_tpm < 0] <- 0
+
+rm("lr_exp")
+invisible(gc())
+
+## Load raw readcounts data ##
+
+lr_count <- as.data.frame(fread(lr_count_file)) %>%
+            filter(IsDefaultEntryForModel == "Yes") %>%
+            select(-V1, -SequencingID, -ModelConditionID, -IsDefaultEntryForModel, -IsDefaultEntryForMC)
+
+invisible(gc())
+
+# Convert data to gene x model matrix
+counts <- lr_count %>%
+          column_to_rownames(var = "ModelID") %>%
+          t()
+
+rm(lr_count)
+invisible(gc())
+
+## Load transcript GTF file ##
+
+if(!file.exists(lr_gtf_outfile))
+{
+  # lr_gtf_gawk_cmd <- paste0("gawk 'BEGIN {FS=\",\"} {if(NR == 1 || ($3 == \"IsoQuant\" && $10 ~ /", paste(unique(cspa$ENTREZ.gene.symbol), collapse = "|"), "/) {print $0}}' ", lr_gtf_file)
+  # lr_gtf_gawk_cmd <- paste0("gawk 'BEGIN {FS=\",\"} {if(NR == 1 || ($3 == \"IsoQuant\" && $4 == \"transcript\")) {print $0}}' ", lr_gtf_file)
+  lr_gtf_gawk_cmd <- paste0("gawk 'BEGIN {FS=\",\"} {if(NR == 1 || $4 == \"transcript\" || $4 == \"exon\") {print $0}}' ", lr_gtf_file)
+  lr_gtf <- as.data.frame(fread(cmd = lr_gtf_gawk_cmd, sep = ","))
+  
+  lr_gtf <- lr_gtf[-1, -1]
+  colnames(lr_gtf) <- c("seqname", "source", "feature", "start", "end", "score", "strand", "frame", "attribute")
+  
+  novel_gtf <- lr_gtf %>%
+                filter(source == "IsoQuant") %>%
+                separate(attribute, into = c("transcript_id", "gene_id", "gene_name"), sep = "; ") %>%
+                mutate(transcript_id = gsub("transcript_id ", "", transcript_id),
+                       gene_id = gsub("gene_id ", "", gene_id),
+                       gene_name = gsub("gene_name ", "", gene_name),
+                       transcript_id = gsub("\"", "", transcript_id),
+                       gene_id = gsub("\"", "", gene_id),
+                       gene_name = gsub("\"", "", gene_name))
+  known_gtf <- lr_gtf %>%
+                filter(source != "IsoQuant") %>%
+                separate(attribute, into = c("gene_id", "transcript_id", "gene_type", "gene_name"), sep = "; ") %>%
+                select(-gene_type) %>%
+                mutate(transcript_id = gsub("transcript_id ", "", transcript_id),
+                       gene_id = gsub("gene_id ", "", gene_id),
+                       gene_name = gsub("gene_name ", "", gene_name),
+                       transcript_id = gsub("\"", "", transcript_id),
+                       gene_id = gsub("\"", "", gene_id),
+                       gene_name = gsub("\"", "", gene_name))
+  
+  lr_gtf_with_exons <- bind_rows(novel_gtf, known_gtf) %>%
+                        mutate(Uniprot_surface = case_when(gene_name %in% uniprot_annot$`Gene Names` ~ TRUE,
+                                                           .default = FALSE),
+                               CSPA_surface = case_when(gene_name %in% cspa$ENTREZ.gene.symbol ~ TRUE,
+                                                        .default = FALSE),
+                               Bausch_Fluck_surface = case_when(gene_name %in% bf_annot$`UniProt gene` |
+                                                                  str_extract(gene_id, "[^\\.]+") %in% bf_annot$`Ensembl gene` ~ TRUE,
+                                                                .default = FALSE))
+  
+  lr_gtf <- lr_gtf_with_exons %>% filter(feature == "transcript")
+  
+  rm("novel_gtf", "known_gtf")
+  
+  invisible(gc())
+  
+  write_tsv(lr_gtf, lr_gtf_outfile)
+  write_tsv(lr_gtf_with_exons, lr_gtf_exons_outfile)
+  
+  novel_surf_gtf <- lr_gtf %>% filter(source == "IsoQuant" & (Uniprot_surface | CSPA_surface | Bausch_Fluck_surface))
+  write_tsv(novel_surf_gtf, novel_surf_gtf_outfile)
+
+  surf_gtf <- lr_gtf %>% filter(Uniprot_surface | CSPA_surface | Bausch_Fluck_surface)
+  write_tsv(surf_gtf, surf_gtf_outfile)
+
+} else {
+  lr_gtf <- read_tsv(lr_gtf_outfile)
+  lr_gtf_with_exons <- read_tsv(lr_gtf_exons_outfile)
+  surf_gtf <- read_tsv(surf_gtf_outfile)
+}
+
+# Metadata for models with LR RNA-seq data
+mtdt <- all_mtdt %>%
+        filter(ModelID %in% colnames(expr_mat_tpm)) %>%
+        mutate(OncotreePrimaryDisease = case_when(grepl("Undifferentiated Pleomorphic Sarcoma", OncotreePrimaryDisease) ~ "Undifferentiated Pleomorphic Sarcoma",
+               OncotreePrimaryDisease == "Hepatocellular Carcinoma plus Intrahepatic Cholangiocarcinoma" ~ "Cholangiocarcinoma & Hepatocellular Carcinoma",
+               .default = OncotreePrimaryDisease))
+
+```
+
+## Calculate tau score on linear TPM
+
+```{r}
+
+# Calculate tau score (high tau = cancer type-specific expression)
+tau_score <- function(x)
+{
+  if (max(x) == 0) return(0)
+  x <- x / max(x)
+  sum(1 - x) / (length(x) - 1)
+}
+
+cancer_groups <- split(seq_len(nrow(mtdt)), mtdt$OncotreePrimaryDisease)
+                       
+mean_by_cancer <- sapply(cancer_groups, function(idx) rowMeans(expr_mat_tpm[, idx, drop = FALSE]))
+
+tau <- data.frame(tau = apply(mean_by_cancer, 1, tau_score)) %>%
+        rownames_to_column("transcript_id")
+
+# rm(expr_mat_tpm)
+# invisible(gc())
+
+```
+
+# Differential gene expression analysis at the lineage level
+
+```{r}
+# 
+# # Define cancer types (or lineages) of interest
+# LOI <- c("Myeloid",
+#           "Lymphoid",
+#           "CNS/Brain",
+#           "Bowel",
+#           "Esophagus/Stomach",
+#           "Lung",
+#           "Biliary Tract")
+# 
+# lin_txp_de <- list()
+# counts <- counts[, mtdt$ModelID]
+# 
+# # Calculate statistics for each cancer type
+# for(lin in LOI)
+# {
+# 
+#   cat(paste0(getTime(), " [-] Working on cancer type: ", lin, "\n"))
+#   
+#   curMtdt <- mtdt
+#   curMtdt$is_target <- curMtdt$OncotreeLineage == lin
+#   
+#   # expressed <- rowMeans(lr_exp_mat[, lin_models]) > min_log_tpm # Only keep isoforms with minimum 1 log2TPM
+#   
+#   y <- DGEList(counts = counts)
+#   
+#   # Filter lowly expressed isoforms
+#   keep <- filterByExpr(y, group = mtdt$is_target, min.count = 5, min.total.count = 10)
+#   y <- y[keep, ]
+#   
+#   # Normalize library sizes
+#   y <- calcNormFactors(y)
+#   
+#   design <- model.matrix(~ curMtdt$is_target)
+#   
+#   # Voom transform
+#   v <- voom(y, design)
+#   
+#   # Fit model
+#   fit <- lmFit(v, design)
+#   fit <- eBayes(fit)
+#   
+#   de <- topTable(fit, coef = 2, number = Inf)
+# 
+#   lin_txp_de[[lin]] <- de %>%
+#                   rownames_to_column("transcript_id") %>%
+#                   left_join(tau, by = "transcript_id") %>%
+#                   mutate(OncotreeLineage = lin,
+#                          surface = ifelse(transcript_id %in% surf_gtf$transcript_id, TRUE, FALSE),
+#                          novel = ifelse(grepl("TCON", transcript_id), TRUE, FALSE),
+#                          novel_surface = ifelse(surface & novel, TRUE, FALSE)) %>%
+#                   rename(p.value = P.Value, FDR = adj.P.Val) %>%
+#                   left_join(select(lr_gtf, transcript_id, gene_name, Uniprot_surface, CSPA_surface, Bausch_Fluck_surface), by = "transcript_id") %>%
+#                   mutate(novel = factor(novel, levels = c(TRUE, FALSE)),
+#                          surface = factor(surface, levels = c(TRUE, FALSE)),
+#                          novel_surface = factor(novel_surface, levels = c(TRUE, FALSE)))
+#   
+#   lin_txp_de[[lin]] %<>% select(OncotreeLineage, transcript_id, gene_name, names(.))
+# 
+#   vol <- lin_txp_de[[lin]] %>%
+#           arrange(desc(novel_surface)) %>%
+#           ggplot(aes(logFC, -log10(FDR))) +
+#           geom_point(aes(color = novel_surface, shape = novel),
+#                      alpha = 0.7,
+#                      size = 3) +
+#           geom_text_repel(data = subset(lin_txp_de[[lin]], novel_surface == TRUE & FDR < 0.2),
+#                           aes(label = paste(gene_name, transcript_id, sep = ": ")),
+#                           min.segment.length = 0) +
+#           geom_hline(yintercept = -log10(0.2), linetype = "dashed") +
+#           facet_wrap(~OncotreeLineage) +
+#           scale_color_manual(values = c("tomato3", "navyblue")) +
+#           scale_shape_manual(values = c(17, 19)) +
+#           labs(x = "Log2FoldChange",
+#                y = "-Log10(FDR)",
+#                color = "Novel Surface Isoform",
+#                shape = "Novel Isoform") +
+#           theme_bw() +
+#           theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+#                 axis.text.x = element_text(size = 20),
+#                 axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+#                 axis.text.y = element_text(size = 20),
+#                 legend.title = element_text(size = 16),
+#                 legend.text = element_text(size = 12),
+#                 strip.text = element_text(size = 16),
+#                 plot.margin = margin(7, 7, 7, 7, "mm"))
+#   
+#   png(file.path(volPlotDir, paste0(gsub("-|/", "_", lin), "_novel_isoform_volcano_plot.png")), height = 720, width = 1080)
+#   print(vol)
+#   dev.off()
+#   
+#   rm("y", "design", "v", "fit", "de", "vol")
+# 
+# }
+# 
+# lin_txp_de <- do.call("bind_rows", lin_txp_de)
+#           
+# lin_txp_de_hits <- lin_txp_de %>% filter(novel_surface == TRUE & FDR < 0.2)
+
+```
+
+# Differential gene expression analysis at the primary disease level
+
+```{r}
+
+# Define cancer types (or lineages) of interest
+CTOI <- c("Acute Myeloid Leukemia",
+          "Adult-Type Diffuse Glioma",
+          "Pancreatic Adenocarcinoma",
+          "Colorectal Adenocarcinoma",
+          "Esophagogastric Adenocarcinoma",
+          "Esophageal Squamous Cell Carcinoma",
+          "Non-Small Cell Lung Cancer",
+          "Intraductal Papillary Neoplasm of the Bile Duct")
+
+if(!file.exists(file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_transcript_differential_expression_results.txt")))
+{
+  txp_de <- list()
+  counts <- counts[, mtdt$ModelID]
+  
+  # Calculate statistics for each cancer type
+  for(CT in CTOI)
+  {
+  
+    cat(paste0(getTime(), " [-] Working on cancer type: ", CT, "\n"))
+    
+    curLin <- unique(mtdt$OncotreeLineage[which(mtdt$OncotreePrimaryDisease == CT)])
+    
+    ## Primary disease vs. all others ##
+    
+    curMtdt <- mtdt
+    curMtdt$is_target <- curMtdt$OncotreePrimaryDisease == CT
+    
+    y <- DGEList(counts = counts)
+    
+    # Filter lowly expressed isoforms
+    keep <- filterByExpr(y, group = curMtdt$is_target, min.count = 5, min.total.count = 10)
+    y <- y[keep, ]
+    
+    # Normalize library sizes
+    y <- calcNormFactors(y)
+    
+    design <- model.matrix(~ curMtdt$is_target)
+    
+    # Voom transform
+    v <- voom(y, design)
+    
+    # Fit model
+    fit <- lmFit(v, design)
+    fit <- eBayes(fit)
+    
+    de_vs_all <- topTable(fit, coef = 2, number = Inf) %>%
+                  rownames_to_column("transcript_id") %>%
+                  rename(p.value = P.Value, FDR = adj.P.Val)
+    
+    colnames(de_vs_all)[-1] <- paste0(colnames(de_vs_all)[-1], "_vs_all_others")
+
+    rm("y", "design", "v", "fit")
+    
+    ## Primary disease vs. others within lineage
+    
+    curMtdt %<>% filter(OncotreeLineage == curLin)
+    
+    curMtdt$is_target <- curMtdt$OncotreePrimaryDisease == CT
+    
+    if(sum(curMtdt$is_target == FALSE) >= 5 & sum(curMtdt$is_target == TRUE) >= 5)
+    {
+      y <- DGEList(counts = counts[, unique(curMtdt$ModelID)])
+      
+      # Filter lowly expressed isoforms
+      keep <- filterByExpr(y, group = curMtdt$is_target, min.count = 5, min.total.count = 10)
+      y <- y[keep, ]
+      
+      # Normalize library sizes
+      y <- calcNormFactors(y)
+      
+      design <- model.matrix(~ curMtdt$is_target)
+      
+      # Voom transform
+      v <- voom(y, design)
+      
+      # Fit model
+      fit <- lmFit(v, design)
+      fit <- eBayes(fit)
+      
+      de_vs_lin <- topTable(fit, coef = 2, number = Inf) %>%
+                    rownames_to_column("transcript_id") %>%
+                    rename(p.value = P.Value, FDR = adj.P.Val)
+      
+      colnames(de_vs_lin)[-1] <- paste0(colnames(de_vs_lin)[-1], "_vs_others_in_lineage")
+      
+      rm("y", "design", "v", "fit")
+      
+      de <- full_join(de_vs_all, de_vs_lin, by = "transcript_id") %>%
+            left_join(tau, by = "transcript_id") %>%
+            mutate(OncotreePrimaryDisease = CT,
+                   surface = ifelse(transcript_id %in% surf_gtf$transcript_id, TRUE, FALSE),
+                   novel = ifelse(grepl("TCON", transcript_id), TRUE, FALSE),
+                   novel_surface = ifelse(surface & novel, TRUE, FALSE)) %>%
+            left_join(select(lr_gtf, transcript_id, gene_name, Uniprot_surface, CSPA_surface, Bausch_Fluck_surface), by = "transcript_id") %>%
+            mutate(novel = factor(novel, levels = c(TRUE, FALSE), labels = c("Novel Isoform", "Annotated Isoform")),
+                   surface = factor(surface, levels = c(TRUE, FALSE), labels = c("Surface Protein", "Other")),
+                   novel_surface = factor(novel_surface, levels = c(TRUE, FALSE))) %>%
+            rename(AveExpr_all_models = AveExpr_vs_all_others, AveExpr_in_lineage = AveExpr_vs_others_in_lineage)
+    
+      rm("de_vs_all", "de_vs_lin")
+      
+    } else {
+      
+      de <- de_vs_all %>%
+            left_join(tau, by = "transcript_id") %>%
+            mutate(OncotreePrimaryDisease = CT,
+                   surface = ifelse(transcript_id %in% surf_gtf$transcript_id, TRUE, FALSE),
+                   novel = ifelse(grepl("TCON", transcript_id), TRUE, FALSE),
+                   novel_surface = ifelse(surface & novel, TRUE, FALSE)) %>%
+            left_join(select(lr_gtf, transcript_id, gene_name, Uniprot_surface, CSPA_surface, Bausch_Fluck_surface), by = "transcript_id") %>%
+            mutate(novel = factor(novel, levels = c(TRUE, FALSE), labels = c("Novel Isoform", "Annotated Isoform")),
+                   surface = factor(surface, levels = c(TRUE, FALSE), labels = c("Surface Protein", "Other")),
+                   novel_surface = factor(novel_surface, levels = c(TRUE, FALSE))) %>%
+            rename(AveExpr_all_models = AveExpr_vs_all_others)
+    }
+    
+    txp_de[[CT]] <- de %>% select(OncotreePrimaryDisease, transcript_id, gene_name, names(.))
+    
+    rm("de", "curMtdt")
+    
+  }
+  
+  txp_de <- do.call("bind_rows", txp_de) %>%
+            mutate(transcript_id_stripped = str_extract(transcript_id, "[^\\.]+")) %>%
+            select(OncotreePrimaryDisease, transcript_id, transcript_id_stripped, names(.)) %>%
+            left_join(select(txp_annot, transcript_id_stripped = ensembl_transcript_id, ensembl_canonical = transcript_is_canonical), by = "transcript_id_stripped") %>%
+
+  
+  write_tsv(txp_de, file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_transcript_differential_expression_results.txt"))
+  
+} else {
+  txp_de <- read_tsv(file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_transcript_differential_expression_results.txt"))
+}
+
+# txp_de_hits <- txp_de %>% filter(surface == "Surface Protein" & logFC_vs_all_others > 2 & FDR_vs_all_others < 0.01) %>%
+#                           left_join(select(txp_annot, transcript_id_stripped = ensembl_transcript_id, ensembl_canonical = transcript_is_canonical), by = "transcript_id_stripped")
+
+```
+
+## Generate statistics for each transcript hit relative to all other transcripts for a given gene
+
+```{r}
+
+hit_genes <- unique(txp_de$gene_name[which(txp_de$surface == "Surface Protein" & txp_de$logFC_vs_all_others > 1.9 & txp_de$FDR_vs_all_others < 0.01)])
+hit_genes_txps <- lr_gtf$transcript_id[which(lr_gtf$gene_name %in% hit_genes)]
+
+hit_genes_exp <- as.data.frame(expr_mat_log[which(rownames(expr_mat_log) %in% unique(hit_genes_txps)), ]) %>%
+                  rownames_to_column("transcript_id") %>%
+                  pivot_longer(cols = !transcript_id, names_to = "ModelID", values_to = "log2TPM") %>%
+                  left_join(select(mtdt, ModelID, OncotreePrimaryDisease, OncotreeLineage), by = "ModelID") %>%
+                  left_join(select(lr_gtf, transcript_id, gene_name), by = "transcript_id") %>%
+                  filter(OncotreePrimaryDisease %in% CTOI)
+
+hit_genes_exp_stat <- hit_genes_exp %>%
+                      group_by(OncotreePrimaryDisease, ModelID, gene_name) %>%
+                      mutate(total_exp = sum(log2TPM, na.rm = TRUE),
+                             prop_total_exp = log2TPM/sum(log2TPM, na.rm = TRUE),
+                             is_highest_prop = prop_total_exp == max(prop_total_exp, na.rm = TRUE)) %>%
+                      ungroup() %>%
+                      group_by(OncotreePrimaryDisease, gene_name, transcript_id) %>%
+                      summarise(min_prop_total_exp = min(prop_total_exp, na.rm = TRUE),
+                                median_prop_total_exp = median(prop_total_exp, na.rm = TRUE),
+                                max_prop_total_exp = max(prop_total_exp, na.rm = TRUE),
+                                num_models = length(unique(ModelID)),
+                                num_models_prop_exp_gt_half = sum(prop_total_exp > 0.5, na.rm = TRUE),
+                                pct_models_prop_exp_gt_half = round(num_models_prop_exp_gt_half/num_models*100, 1),
+                                num_models_is_highest_prop = sum(is_highest_prop == TRUE, na.rm = TRUE),
+                                pct_models_is_highest_prop = round(num_models_is_highest_prop/num_models*100, 1)) %>%
+                      arrange(desc(median_prop_total_exp)) %>%
+                      ungroup() %>%
+                      as.data.frame()
+
+med_exp <- hit_genes_exp %>%
+            group_by(OncotreePrimaryDisease, gene_name, transcript_id) %>%
+            summarise(median_log2TPM = median(log2TPM, na.rm = TRUE),
+                      max_log2TPM = max(log2TPM, na.rm = TRUE)) %>%
+            ungroup() %>%
+            as.data.frame()
+
+```
+
+## Get table of hits with statistics
+
+```{r}
+
+txp_de_hits <- txp_de %>%
+                filter(surface == "Surface Protein" & logFC_vs_all_others > 1.9 & FDR_vs_all_others < 0.01) %>%
+                select(OncotreePrimaryDisease, transcript_id, transcript_id_stripped, gene_name,
+                       surface, novel, novel_surface, Uniprot_surface, CSPA_surface, Bausch_Fluck_surface,
+                       tau, logFC_vs_all_others, p.value_vs_all_others, FDR_vs_all_others,
+                       logFC_vs_others_in_lineage, p.value_vs_others_in_lineage, FDR_vs_others_in_lineage) %>%
+                left_join(med_exp, by = c("OncotreePrimaryDisease", "gene_name", "transcript_id")) %>%
+                left_join(hit_genes_exp_stat, by = c("OncotreePrimaryDisease", "gene_name", "transcript_id")) %>%
+                left_join(select(txp_annot, transcript_id_stripped = ensembl_transcript_id, ensembl_canonical = transcript_is_canonical), by = "transcript_id_stripped") %>%
+                select(-transcript_id_stripped) %>%
+                mutate(ensembl_canonical = case_when(is.na(ensembl_canonical) ~ FALSE, .default = ensembl_canonical),
+                       gene_transcript = paste(gene_name, transcript_id, sep = ": ")) %>%
+                group_by(OncotreePrimaryDisease) %>%
+                arrange(desc(logFC_vs_all_others)) %>%
+                ungroup() %>%
+                select(OncotreePrimaryDisease, transcript_id, gene_name, median_log2TPM, max_log2TPM, tau, names(.)) %>%
+                relocate(all_of(c("surface", "novel", "novel_surface", "Uniprot_surface", "CSPA_surface", "Bausch_Fluck_surface")), .after = last_col()) %>%
+                as.data.frame()
+
+txp_de_hits %>% filter(!ensembl_canonical) %>% write_tsv(file.path(outdir, "LRR_top_differentially_expressed_hits_non_canonical.txt"))
+
+```
+
+
+```{r}
+
+# Subset data for faster parsing
+hit_dat <- as.data.frame(expr_mat_log[which(rownames(expr_mat_log) %in% unique(txp_de_hits$transcript_id)), ]) %>%
+            rownames_to_column("transcript_id") %>%
+            pivot_longer(cols = !transcript_id, names_to = "ModelID", values_to = "log2TPM") %>%
+            left_join(select(mtdt, ModelID, OncotreePrimaryDisease, OncotreeLineage), by = "ModelID") %>%
+            left_join(select(lr_gtf, transcript_id, gene_name), by = "transcript_id") %>%
+            mutate(gene_transcript = paste(gene_name, transcript_id, sep = ": ")) %>%
+            as.data.frame()
+
+# hit_dat_gt_1 <- as.data.frame(hit_dat) %>%
+#                 rownames_to_column("transcript_id") %>%
+#                 pivot_longer(cols = !transcript_id, names_to = "ModelID", values_to = "log2TPM") %>%
+#                 left_join(select(mtdt, ModelID, OncotreeLineage, OncotreePrimaryDisease), by = "ModelID") %>% 
+#                 group_by(transcript_id, OncotreePrimaryDisease) %>%
+#                 summarise(num_models_gt_1_log2TPM = sum(log2TPM > 1, na.rm = TRUE)) %>%
+#                 ungroup() %>%
+#                 as.data.frame()
+# 
+# txp_de_hits %<>% left_join(select(hit_dat_gt_1, transcript_id, OncotreePrimaryDisease, num_models_gt_1_log2TPM), by = c("transcript_id", "OncotreePrimaryDisease")) %>%
+#                   filter(num_models_gt_1_log2TPM >= 3)
+
+```
+
+## Volcano plot for each cancer type
+
+```{r}
+
+for(CT in CTOI)
+{
+  curDat <- txp_de %>% filter(OncotreePrimaryDisease == CT) %>%
+                        mutate(category = case_when((novel_surface == TRUE & logFC > 2 & FDR < 0.05) ~ "hit",
+                                                    (logFC > 2 | logFC < -2) & FDR < 0.05 ~ "LFC + FDR",
+                                                    logFC > 2 | logFC < -2 ~ "LFC",
+                                                    FDR < 0.05 ~ "FDR",
+                                                    .default = "other"))
+
+  vol <- curDat %>%
+          arrange(desc(novel_surface)) %>%
+          ggplot(aes(logFC, -log10(FDR))) +
+          geom_point(data = subset(curDat, category %in% c("LFC", "FDR", "other")),
+                     aes(shape = novel),
+                     color = "lightgrey",
+                     alpha = 0.4,
+                     size = 4) +
+          geom_point(data = subset(curDat, category == "LFC + FDR"),
+                 aes(color = surface, shape = novel),
+                 # color = "tomato3",
+                 alpha = 0.4,
+                 size = 4) +
+          geom_point(data = subset(curDat, category == "hit"),
+             aes(shape = novel),
+             color = "navyblue",
+             alpha = 0.8,
+             size = 4) +
+          geom_text_repel(data = subset(curDat, category == "hit"),
+                          aes(label = paste(gene_name, transcript_id, sep = ": ")),
+                          min.segment.length = 0,
+                          color = "navyblue",
+                          fontface = "bold",
+                          max.overlaps = Inf,
+                          size = 5) +
+          geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+          geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+          facet_wrap(~OncotreePrimaryDisease) +
+          scale_color_manual(values = c("navyblue", "tomato3")) +
+          scale_shape_manual(values = c(17, 19)) +
+          labs(x = "Log2FoldChange",
+               y = "-Log10(FDR)",
+               color = "Surface Protein",
+               shape = "Novel Isoform") +
+          guides(color = guide_legend(override.aes = list(size = 3), nrow = 2, byrow = TRUE),
+                 shape = guide_legend(override.aes = list(size = 3), nrow = 2, byrow = TRUE)) +
+          theme_bw() +
+          theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+                axis.text.x = element_text(size = 20),
+                axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+                axis.text.y = element_text(size = 20),
+                legend.title = element_blank(),
+                legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+                legend.position = "bottom",
+                legend.spacing.x = unit(50, "pt"),
+                legend.key.spacing.x = unit(10, "pt"),
+                strip.text = element_text(size = 20),
+                    plot.margin = margin(7, 7, 7, 7, "mm"))
+
+  png(file.path(volPlotDir, paste0(CT, "_novel_isoform_volcano_plot.png")), height = 720, width = 600)
+  print(vol)
+  dev.off()
+
+  rm("curDat", "vol")
+}
+
+# Faceted plot with all cancer types
+vol_dat <- txp_de %>%
+            filter(!OncotreePrimaryDisease %in% c("Esophageal Squamous Cell Carcinoma", "Intraductal Papillary Neoplasm of the Bile Duct")) %>%
+            mutate(category = case_when(novel_surface == TRUE & logFC > 2 & FDR < 0.05 ~ "hit",
+                                        (logFC > 2 | logFC < -2) & FDR < 0.05 ~ "LFC + FDR",
+                                        logFC > 2 | logFC < -2 ~ "LFC",
+                                        FDR < 0.05 ~ "FDR",
+                                        .default = "other"))
+
+txp_de_vol <- vol_dat %>%
+              ggplot(aes(logFC, -log10(FDR))) +
+              geom_point(data = subset(vol_dat, category %in% c("LFC", "FDR", "other")),
+                         aes(shape = novel),
+                         color = "lightgrey",
+                         alpha = 0.4,
+                         size = 4) +
+              geom_point(data = subset(vol_dat, category == "LFC + FDR"),
+                     aes(color = surface, shape = novel),
+                     alpha = 0.4,
+                     size = 4) +
+              geom_point(data = subset(vol_dat, category == "hit"),
+                 aes(shape = novel),
+                 color = "navyblue",
+                 alpha = 0.8,
+                 size = 4) +
+              geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+              geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+              facet_wrap(~OncotreePrimaryDisease, ncol = 3, scales = "free") +
+              scale_color_manual(values = c("navyblue", "tomato3")) +
+              scale_shape_manual(values = c(17, 19)) +
+              labs(x = "Log2FoldChange",
+                   y = "-Log10(FDR)",
+                   color = "Surface Protein",
+                   shape = "Novel Isoform") +
+              guides(color = guide_legend(override.aes = list(size = 3), nrow = 2, byrow = TRUE),
+                     shape = guide_legend(override.aes = list(size = 3), nrow = 2, byrow = TRUE)) +
+              theme_bw() +
+              theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+                    axis.text.x = element_text(size = 20),
+                    axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+                    axis.text.y = element_text(size = 20),
+                    legend.title = element_blank(),
+                    legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+                    legend.position = "bottom",
+                    legend.spacing.x = unit(100, "pt"),
+                    legend.key.spacing.x = unit(10, "pt"),
+                    strip.text = element_text(size = 20),
+                    plot.margin = margin(7, 7, 7, 7, "mm"))
+
+png(file.path(volPlotDir, "OncotreePrimaryDisease_novel_isoform_volcano_plot.png"), height = 840, width = 1680)
+print(txp_de_vol)
+dev.off()
+
+rm(vol_dat)
+
+```
+
+## Get CRC specific hits and create GTF file
+
+```{r}
+
+# Pull hits that are specific to CRC
+CRC_hits <- txp_de_hits %>% filter(OncotreePrimaryDisease == "Colorectal Adenocarcinoma")
+CRC_noncanon_hits <- CRC_hits %>% filter(!ensembl_canonical) %>% distinct()
+
+CRC_hits %>% select(-gene_transcript) %>% write_tsv(file.path(analysis_outdir, "CRC_overexpressed_hits_all_transcripts.txt"))
+CRC_noncanon_hits %>% select(-gene_transcript) %>% write_tsv(file.path(analysis_outdir, "CRC_overexpressed_hits_noncanonical_transcripts.txt"))
+
+# Create GTF file with only hit transcripts
+CRC_hit_gtf_file <- file.path(analysis_outdir, "CRC_overexpressed_hits_noncanonical_transcripts.gtf")
+CRC_hit_gtf <- lr_gtf_with_exons %>%
+                select(-c(grep("surface", names(.)))) %>%
+                filter(transcript_id %in% CRC_noncanon_hits$transcript_id) %>%
+                mutate(exon_number = case_when(feature == "exon" ~ gsub("exon_number |;", "", gene_name))) %>%
+                group_by(transcript_id) %>%
+                mutate(gene_name = first(gene_name[feature == "transcript"])) %>%
+                ungroup() %>%
+                # mutate(attribute = case_when(feature == "transcript" ~ paste0('gene_id "', gene_id, '"; ',
+                #                                                               'transcript_id "', transcript_id, '"; ',
+                #                                                               'gene_name "', gsub(";", "", gene_name), '";'),
+                #                              feature == "exon" ~ paste0('gene_id "', gene_id, '"; ',
+                #                                                         'transcript_id "', transcript_id, '"; ',
+                #                                                         'gene_name "', gsub(";", "", gene_name), '"; ',
+                #                                                         'exon_number "', exon_number, '";'))) %>%
+                mutate(attribute = paste0('gene_id "', gene_id, '"; ',
+                                          'transcript_id "', transcript_id, '"; ',
+                                          'gene_name "', gsub(";", "", gene_name), '";')) %>%
+                select(-gene_id, -transcript_id, -gene_name, -exon_number) %>%
+                as.data.frame()
+
+write_tsv(CRC_hit_gtf, CRC_hit_gtf_file, escape = "none", col_names = FALSE)
+
+```
+
+## Volcano plot for CRC
+
+```{r}
+
+CRC <- txp_de %>% filter(OncotreePrimaryDisease == "Colorectal Adenocarcinoma") %>%
+                  mutate(category = case_when(transcript_id %in% CRC_noncanon_hits$transcript_id ~ "hit",
+                                              .default = "other")) %>%
+                  as.data.frame()
+
+CRC_vol <- CRC %>%
+            arrange(desc(category)) %>%
+            ggplot(aes(logFC_vs_all_others, -log10(FDR_vs_all_others))) +
+            geom_point(data = subset(CRC, category == "other"),
+                       # aes(shape = novel),
+                       color = "navyblue",
+                       alpha = 0.4,
+                       size = 4) +
+            geom_point(data = subset(CRC, category == "hit"),
+               # aes(shape = novel),
+               color = "tomato3",
+               alpha = 0.8,
+               size = 4) +
+            # geom_text_repel(data = subset(CRC, category == "hit" & logFC_vs_all_others > 4),
+            #                 aes(label = paste(gene_name, transcript_id, sep = ": ")),
+            #                 min.segment.length = 0,
+            #                 color = "tomato3",
+            #                 fontface = "bold",
+            #                 max.overlaps = Inf,
+            #                 size = 5) +
+            # geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+            # geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+            facet_wrap(~OncotreePrimaryDisease) +
+            # scale_color_manual(values = c("navyblue", "tomato3")) +
+            scale_shape_manual(values = c(17, 19)) +
+            labs(x = "Log2FoldChange",
+                 y = "-Log10(FDR)",
+                 # color = "Surface Protein",
+                 shape = "Novel Isoform") +
+            # guides(color = guide_legend(override.aes = list(size = 3), nrow = 2, byrow = TRUE),
+            #        shape = guide_legend(override.aes = list(size = 3), nrow = 2, byrow = TRUE)) +
+            theme_bw() +
+            theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+                  axis.text.x = element_text(size = 20),
+                  axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+                  axis.text.y = element_text(size = 20),
+                  legend.title = element_blank(),
+                  legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+                  legend.position = "bottom",
+                  legend.spacing.x = unit(50, "pt"),
+                  legend.key.spacing.x = unit(10, "pt"),
+                  strip.text = element_text(size = 20),
+                      plot.margin = margin(7, 7, 7, 7, "mm"))
+
+png(file.path(volPlotDir, "CRC_volcano_plot_with_hits.png"), height = 720, width = 900)
+print(CRC_vol)
+dev.off()
+
+
+```
+
+
+## Plot hits across cancer types (just CRC for now)
+
+```{r}
+die
+# Plot hits
+for(hit in unique(CRC_noncanon_hits$transcript_id))
+{
+
+  hit_gene <- lr_gtf$gene_name[which(lr_gtf$transcript_id == hit)]
+  
+  pd_hits <- unique(txp_de_hits$OncotreePrimaryDisease[which(txp_de_hits$transcript_id == hit)])
+  lin_hits <- unique(mtdt$OncotreeLineage[which(mtdt$OncotreePrimaryDisease %in% pd_hits)])
+  
+  curDat <- hit_dat %>%
+            filter(transcript_id == hit) %>%
+            mutate(OncotreePrimaryDisease = case_when(OncotreePrimaryDisease %in% pd_hits ~ OncotreePrimaryDisease,
+                                                      OncotreeLineage %in% lin_hits ~ paste("Other ", OncotreeLineage),
+                                                      .default = OncotreeLineage))
+  
+  curDatMean <- curDat %>%
+                group_by(OncotreePrimaryDisease) %>%
+                summarise(mean_log2TPM = mean(log2TPM, na.rm = TRUE)) %>%
+                ungroup() %>%
+                arrange(desc(mean_log2TPM)) %>%
+                as.data.frame()
+  
+  curDat %<>% mutate(OncotreePrimaryDisease = factor(OncotreePrimaryDisease, levels = curDatMean$OncotreePrimaryDisease),
+                     is_hit = factor(ifelse(OncotreePrimaryDisease %in% pd_hits, TRUE, FALSE), levels = c(TRUE, FALSE), labels = c("Hit Cancer Type", "Other Lineages")))
+  
+  bp <- curDat %>%
+        ggplot(aes(OncotreePrimaryDisease, log2TPM)) +
+        geom_point(aes(color = is_hit),
+                   position = position_jitter(width = 0.15),
+                   alpha = 0.7,
+                   size = 3) +
+        geom_boxplot(alpha = 0.5, width = 0.2, outliers = FALSE) +
+        scale_color_manual(values = c("tomato3", "navyblue")) +
+        labs(y = "Log2(TPM + 1)",
+              color = "Hit Cancer Type") +
+        guides(color = guide_legend(override.aes = list(size = 3))) +
+        facet_wrap(~gene_transcript) +
+        theme_bw() +
+        theme(axis.title.x = element_blank(),
+              axis.text.x = element_text(angle = -45, hjust = 0, size = 14),
+              axis.title.y = element_text(size = 20, margin = margin(r = 5, unit = "mm")),
+              axis.text.y = element_text(size = 20),
+              legend.title = element_blank(),
+              legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+              legend.position = "bottom",
+              legend.key.spacing.x = unit(20, "pt"),
+              strip.text = element_text(size = 20),
+              plot.margin = margin(7, 7, 7, 7, "mm"))
+  
+  png(file.path(boxplotDir, paste("LRR", hit_gene, hit, "expression_across_cancer_types.png", sep = "_")), height = 720, width = 1080)
+  print(bp)
+  dev.off()
+  
+  vol <- CRC %>%
+          arrange(desc(category)) %>%
+          ggplot(aes(logFC_vs_all_others, -log10(FDR_vs_all_others))) +
+          geom_point(data = subset(CRC, transcript_id != hit),
+                     color = "navyblue",
+                     alpha = 0.4,
+                     size = 4) +
+          geom_point(data = subset(CRC, transcript_id == hit),
+             color = "tomato3",
+             alpha = 0.8,
+             size = 4) +
+          geom_text_repel(data = subset(CRC, transcript_id == hit),
+                          aes(label = paste(gene_name, transcript_id, sep = ": ")),
+                          min.segment.length = 0,
+                          color = "tomato3",
+                          fontface = "bold",
+                          # max.overlaps = Inf,
+                          size = 6) +
+          facet_wrap(~OncotreePrimaryDisease) +
+          scale_shape_manual(values = c(17, 19)) +
+          labs(x = "Log2FoldChange",
+               y = "-Log10(FDR)",
+               shape = "Novel Isoform") +
+          theme_bw() +
+          theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+                axis.text.x = element_text(size = 20),
+                axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+                axis.text.y = element_text(size = 20),
+                legend.title = element_blank(),
+                legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+                legend.position = "bottom",
+                legend.spacing.x = unit(50, "pt"),
+                legend.key.spacing.x = unit(10, "pt"),
+                strip.text = element_text(size = 20),
+                    plot.margin = margin(7, 7, 7, 7, "mm"))
+  
+  png(file.path(volPlotDir, paste(hit_gene, hit, "CRC_volcano_plot_with_hits.png", sep = "_")), height = 720, width = 900)
+  print(vol)
+  dev.off()
+  
+  rm(curDat)
+  invisible(gc())
+  
+}
+
+```
+
+## Plot logFC vs. tau (just CRC for now)
+
+```{r}
+
+tau_thresh <- 0.85
+lfc_thresh <- 3
+
+CRC_scat_dat <- CRC_hits %>%
+                mutate(ensembl_canonical = case_when(ensembl_canonical == TRUE ~ "Canonical transcript (Ensembl)",
+                                                     ensembl_canonical == FALSE ~ "Non-canonical transcript"))
+
+lfc_vs_tau <- CRC_scat_dat %>%
+              ggplot(aes(tau, logFC_vs_all_others)) +
+              geom_point(aes(color = ensembl_canonical),
+                         size = 4,
+                         alpha = 0.6) +
+              geom_text_repel(data = subset(CRC_scat_dat, tau > tau_thresh & logFC_vs_all_others > lfc_thresh & ensembl_canonical == "Non-canonical transcript"),
+                              aes(label = gene_transcript),
+                              size = 3.5,
+                              fontface = "bold",
+                              min.segment.length = 0,
+                              max.overlaps = Inf) +
+              geom_vline(xintercept = tau_thresh, linetype = "dashed") +
+              geom_hline(yintercept = lfc_thresh, linetype = "dashed") +
+              scale_color_manual(values = c("navyblue", "tomato3")) +
+              labs(x = "Tau (cancer type-specific expression)",
+                   y = "Log2FC (CRC vs. all other diseases)") +
+              theme_bw() +
+              theme(axis.title.x = element_text(size = 16, margin = margin(t = 5, unit = "mm")),
+                    axis.text.x = element_text(size = 16),
+                    axis.title.y = element_text(size = 16, margin = margin(r = 5, unit = "mm")),
+                    axis.text.y = element_text(size = 16),
+                    legend.title = element_blank(),
+                    legend.text = element_text(size = 12),
+                    legend.position = "bottom",
+                    plot.margin = margin(5, 5, 5, 5, "mm"))
+
+png(file.path(outdir, "CRC_logFC_vs_tau.png"), height = 720, width = 960)
+print(lfc_vs_tau)
+dev.off()
+
+```
+
+## Load O-link data
+
+```{r}
+
+olink_annot <- read_csv(file.path(olinkDataDir, "uniprot_hugo_entrez_id_mapping_26q1.csv")) %>% as.data.frame()
+
+olink <- read_csv(file.path(olinkDataDir, "harmonized_olink_lysate_26Q1_filtered.csv")) %>% as.data.frame()
+
+olink_mtdt <- all_mtdt %>%
+              filter(ModelID %in% olink$SampleID) %>%
+              mutate(OncotreePrimaryDisease = case_when(StrippedCellLineName == "HS602" ~ "Lymphoid Neoplasm",
+                                                        .default = OncotreePrimaryDisease))
+
+```
+
+## Organize O-link data
+
+```{r}
+
+olink_de_outfile <- file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_Olink_differential_expression.txt")
+
+npx_mat <- olink %>%
+            column_to_rownames(var = "SampleID") %>%
+            mutate(across(everything(), as.numeric)) %>%
+            t()
+
+npx_mat <- npx_mat[, olink_mtdt$ModelID]
+
+keep_protein <- rowSums(!is.na(npx_mat)) >= 3
+npx_mat <- npx_mat[keep_protein, , drop = FALSE]
+
+```
+
+## Differential protein expression analysis
+
+```{r}
+
+if(!file.exists(olink_de_outfile))
+{
+  olink_de <- list()
+  
+  for(CT in CTOI)
+  {
+    curMtdt <- olink_mtdt
+    curMtdt$is_target <- curMtdt$OncotreePrimaryDisease == CT
+    
+    dt <- data.frame(detected_target = rowMeans(!is.na(npx_mat[, curMtdt$is_target, drop = FALSE])) >= 0.4) %>%
+          rownames_to_column("UniprotID")
+    
+    design <- model.matrix(~curMtdt$is_target)
+  
+    fit <- lmFit(npx_mat, design, na.action = na.exclude)
+    fit <- eBayes(fit)
+    
+    de <- topTable(fit, coef = 2, number = Inf) %>%
+          rownames_to_column("UniprotID") %>%
+          mutate(OncotreePrimaryDisease = CT) %>%
+          rename(p.value = P.Value, FDR = adj.P.Val) %>%
+          left_join(select(olink_annot, UniprotID, gene_name = Symbol), by = "UniprotID") %>%
+          left_join(dt, by = "UniprotID") %>%
+          mutate(surface = case_when(UniprotID %in% cspa$ID_link | gene_name %in% cspa$ENTREZ.gene.symbol ~ "CSPA Surface Protein",
+                                     .default = "Other"))
+    
+    de %<>% select(OncotreePrimaryDisease, UniprotID, gene_name, names(.))
+    
+    olink_de[[CT]] <- de
+    
+  }
+  
+  olink_de <- do.call("bind_rows", olink_de)
+  
+  write_tsv(olink_de, olink_de_outfile)
+} else {
+  olink_de <- read_tsv(olink_de_outfile)
+}
+
+olink_de_hits <- olink_de %>% filter(surface == "CSPA Surface Protein" & logFC > 2 & FDR < 0.05)
+
+# Subset data for faster parsing
+olink_hit_dat <- as.data.frame(npx_mat[which(rownames(npx_mat) %in% unique(olink_de_hits$UniprotID)), ]) %>%
+                  rownames_to_column("UniprotID") %>%
+                  pivot_longer(cols = !UniprotID, names_to = "ModelID", values_to = "NPX") %>%
+                  left_join(select(olink_mtdt, ModelID, OncotreePrimaryDisease, OncotreeLineage), by = "ModelID") %>%
+                  left_join(select(olink_annot, UniprotID, gene_name = Symbol), by = "UniprotID") %>%
+                  mutate(gene_protein = paste0(gene_name, " (", UniprotID, ")")) %>%
+                  as.data.frame()
+
+```
+
+## Olink volcano plots
+
+```{r}
+
+for(CT in CTOI)
+{
+  curDat <- olink_de %>% filter(OncotreePrimaryDisease == CT) %>%
+                          mutate(category = case_when(surface == "CSPA Surface Protein" & logFC > 2 & FDR < 0.05 ~ "hit",
+                                                      (logFC > 2 | logFC < -2) & FDR < 0.05 ~ "LFC + FDR",
+                                                      logFC > 2 | logFC < -2 ~ "LFC",
+                                                      FDR < 0.05 ~ "FDR",
+                                                      .default = "other"))
+  
+  vol <- curDat %>%
+          arrange(desc(surface)) %>%
+          ggplot(aes(logFC, -log10(FDR))) +
+          geom_point(data = subset(curDat, category %in% c("LFC", "FDR", "other")),
+                     color = "lightgrey",
+                     alpha = 0.4,
+                     size = 4) +
+          geom_point(data = subset(curDat, category == "LFC + FDR"),
+                 aes(color = surface),
+                 # color = "springgreen4",
+                 alpha = 0.7,
+                 size = 4) +
+          geom_point(data = subset(curDat, category == "hit"),
+             color = "purple4",
+             alpha = 0.7,
+             size = 4) +
+          geom_text_repel(data = subset(curDat, category == "hit"),
+                          aes(label = gene_name),
+                          min.segment.length = 0,
+                          color = "purple4",
+                          fontface = "bold",
+                          max.overlaps = Inf,
+                          size = 5) +
+          geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+          geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+          facet_wrap(~OncotreePrimaryDisease) +
+          scale_color_manual(values = c("CSPA Surface Protein" = "purple4",
+                                        "Other" = "aquamarine4")) +
+          labs(x = "Log2FoldChange",
+               y = "-Log10(FDR)",
+               color = "Surface Protein") +
+          guides(color = guide_legend(override.aes = list(size = 3))) +
+          theme_bw() +
+          theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+                axis.text.x = element_text(size = 20),
+                axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+                axis.text.y = element_text(size = 20),
+                legend.title = element_blank(),
+                legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+                legend.position = "bottom",
+                legend.key.spacing.x = unit(25, "pt"),
+                strip.text = element_text(size = 20),
+                plot.margin = margin(7, 7, 7, 7, "mm"))
+  
+  png(file.path(volPlotDir, paste0(CT, "_Olink_volcano_plot.png")), height = 720, width = 600)
+  print(vol)
+  dev.off()
+  
+  rm("curDat", "vol")
+}
+
+# Faceted plot with all cancer types
+vol_dat <- olink_de %>%
+            filter(!OncotreePrimaryDisease %in% c("Esophageal Squamous Cell Carcinoma", "Intraductal Papillary Neoplasm of the Bile Duct")) %>%
+            mutate(category = case_when(surface == "CSPA Surface Protein" & logFC > 2 & FDR < 0.05 ~ "hit",
+                                        (logFC > 2 | logFC < -2) & FDR < 0.05 ~ "LFC + FDR",
+                                        logFC > 2 | logFC < -2 ~ "LFC",
+                                        FDR < 0.05 ~ "FDR",
+                                        .default = "other"))
+
+olink_de_vol <- vol_dat %>%
+              ggplot(aes(logFC, -log10(FDR))) +
+              geom_point(data = subset(vol_dat, category %in% c("LFC", "FDR", "other")),
+                         color = "lightgrey",
+                         alpha = 0.4,
+                         size = 4) +
+              geom_point(data = subset(vol_dat, category == "LFC + FDR"),
+                     aes(color = surface),
+                     # color = "springgreen4",
+                     alpha = 0.7,
+                     size = 4) +
+              geom_point(data = subset(vol_dat, category == "hit"),
+                 color = "purple4",
+                 alpha = 0.7,
+                 size = 4) +
+              # geom_text_repel(data = subset(vol_dat, novel_surface == TRUE & logFC > 2 & FDR < 0.05),
+              #                 aes(label = paste(gene_name, transcript_id, sep = ": ")),
+              #                 min.segment.length = 0,
+              #                 color = "navyblue",
+              #                 fontface = "bold",
+              #                 max.overlaps = Inf,
+              #                 size = 3) +
+              geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+              geom_vline(xintercept = c(-2, 2), linetype = "dashed") +
+              facet_wrap(~OncotreePrimaryDisease, ncol = 3, scales = "free") +
+              scale_color_manual(values = c("CSPA Surface Protein" = "purple4",
+                                            "Other" = "aquamarine4")) +
+              scale_shape_manual(values = c(17, 19)) +
+              labs(x = "Log2FoldChange",
+                   y = "-Log10(FDR)",
+                   color = "Surface Protein") +
+              guides(color = guide_legend(override.aes = list(size = 3))) +
+              theme_bw() +
+              theme(axis.title.x = element_text(size = 24, margin = margin(t = 5, unit = "mm")),
+                    axis.text.x = element_text(size = 20),
+                    axis.title.y = element_text(size = 24, margin = margin(r = 5, unit = "mm")),
+                    axis.text.y = element_text(size = 20),
+                    legend.title = element_blank(),
+                    legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+                    legend.position = "bottom",
+                    legend.key.spacing.x = unit(25, "pt"),
+                    strip.text = element_text(size = 20),
+                    plot.margin = margin(7, 7, 7, 7, "mm"))
+  
+png(file.path(volPlotDir, "OncotreePrimaryDisease_Olink_volcano_plot.png"), height = 840, width = 1680)
+print(olink_de_vol)
+dev.off()
+
+rm(vol_dat)
+
+```
+
+## Plot Olink hits across cancer types
+
+```{r}
+
+for(hit in unique(olink_de_hits$gene_name))
+{
+
+  pd_hits <- unique(olink_de_hits$OncotreePrimaryDisease[which(olink_de_hits$gene_name == hit)])
+  lin_hits <- unique(mtdt$OncotreeLineage[which(mtdt$OncotreePrimaryDisease %in% pd_hits)])
+  
+  curDat <- olink_hit_dat %>%
+            filter(gene_name == hit & !is.na(NPX)) %>%
+            mutate(OncotreePrimaryDisease = case_when(OncotreePrimaryDisease %in% pd_hits ~ OncotreePrimaryDisease,
+                                                      OncotreeLineage %in% lin_hits ~ paste("Other ", OncotreeLineage),
+                                                      .default = OncotreeLineage))
+  
+  curDatMean <- curDat %>%
+                group_by(OncotreePrimaryDisease) %>%
+                summarise(mean_NPX = mean(NPX, na.rm = TRUE)) %>%
+                ungroup() %>%
+                arrange(desc(mean_NPX)) %>%
+                as.data.frame()
+  
+  curDat %<>% mutate(OncotreePrimaryDisease = factor(OncotreePrimaryDisease, levels = curDatMean$OncotreePrimaryDisease),
+                     is_hit = factor(ifelse(OncotreePrimaryDisease %in% pd_hits, TRUE, FALSE), levels = c(TRUE, FALSE), labels = c("Hit Cancer Type", "Other Lineages")))
+  
+  bp <- curDat %>%
+        ggplot(aes(OncotreePrimaryDisease, NPX)) +
+        geom_point(aes(color = is_hit),
+                   position = position_jitter(width = 0.15),
+                   alpha = 0.7,
+                   size = 3) +
+        geom_boxplot(alpha = 0.5, width = 0.2, outliers = FALSE) +
+        scale_color_manual(values = c("tomato3", "navyblue")) +
+        # scale_x_discrete(drop = TRUE) +
+        labs(y = "Normalized Protein Expression (log scale)",
+              color = "Hit Cancer Type") +
+        guides(color = guide_legend(override.aes = list(size = 3))) +
+        facet_wrap(~gene_protein, drop = TRUE) +
+        theme_bw() +
+        theme(axis.title.x = element_blank(),
+              axis.text.x = element_text(angle = -45, hjust = 0, size = 12),
+              axis.title.y = element_text(size = 20, margin = margin(r = 5, unit = "mm")),
+              axis.text.y = element_text(size = 20),
+              legend.title = element_blank(),
+              legend.text = element_text(size = 16, margin = margin(l = -1, unit = "pt")),
+              legend.position = "bottom",
+              legend.key.spacing.x = unit(20, "pt"),
+              strip.text = element_text(size = 20),
+              plot.margin = margin(7, 30, 7, 7, "mm"))
+  
+  png(file.path(boxplotDir, paste("Olink", hit, "protein_expression_across_cancer_types.png", sep = "_")), height = 720, width = 840)
+  print(bp)
+  dev.off()
+  
+  rm("curDat", "curDatMean", "pd_hits", "lin_hits", "bp")
+  invisible(gc())
+  
+}
+
+```
+
+# Differential gene expression analysis at the primary disease level
+
+```{r}
+
+# Define cancer types (or lineages) of interest
+CTOI <- c("Acute Myeloid Leukemia",
+          "Adult-Type Diffuse Glioma",
+          "Pancreatic Adenocarcinoma",
+          "Colorectal Adenocarcinoma",
+          "Esophagogastric Adenocarcinoma",
+          "Esophageal Squamous Cell Carcinoma",
+          "Non-Small Cell Lung Cancer",
+          "Intraductal Papillary Neoplasm of the Bile Duct")
+
+if(!file.exists(file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_transcript_differential_expression_results.txt")))
+{
+  txp_de <- list()
+  counts <- counts[, mtdt$ModelID]
+  
+  # Calculate statistics for each cancer type
+  for(CT in CTOI)
+  {
+  
+    cat(paste0(getTime(), " [-] Working on cancer type: ", CT, "\n"))
+    
+    curMtdt <- mtdt
+    curMtdt$is_target <- curMtdt$OncotreePrimaryDisease == CT
+    
+    y <- DGEList(counts = counts)
+    
+    # Filter lowly expressed isoforms
+    keep <- filterByExpr(y, group = curMtdt$is_target, min.count = 5, min.total.count = 10)
+    y <- y[keep, ]
+    
+    # Normalize library sizes
+    y <- calcNormFactors(y)
+    
+    design <- model.matrix(~ curMtdt$is_target)
+    
+    # Voom transform
+    v <- voom(y, design)
+    
+    # Fit model
+    fit <- lmFit(v, design)
+    fit <- eBayes(fit)
+    
+    de <- topTable(fit, coef = 2, number = Inf) %>%
+          rownames_to_column("transcript_id") %>%
+          left_join(tau, by = "transcript_id") %>%
+          mutate(OncotreePrimaryDisease = CT,
+                 surface = ifelse(transcript_id %in% surf_gtf$transcript_id, TRUE, FALSE),
+                 novel = ifelse(grepl("TCON", transcript_id), TRUE, FALSE),
+                 novel_surface = ifelse(surface & novel, TRUE, FALSE)) %>%
+          rename(p.value = P.Value, FDR = adj.P.Val) %>%
+          left_join(select(lr_gtf, transcript_id, gene_name), by = "transcript_id") %>%
+          mutate(novel = factor(novel, levels = c(TRUE, FALSE), labels = c("Novel Isoform", "Annotated Isoform")),
+                 surface = factor(surface, levels = c(TRUE, FALSE), labels = c("CSPA Surface Protein", "Other")),
+                 novel_surface = factor(novel_surface, levels = c(TRUE, FALSE)))
+
+    txp_de[[CT]] <- de %>% select(OncotreePrimaryDisease, transcript_id, gene_name, names(.))
+    
+    rm("y", "design", "v", "fit", "de", "curMtdt")
+  
+  }
+  
+  txp_de <- do.call("bind_rows", txp_de)
+  
+  write_tsv(txp_de, file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_transcript_differential_expression_results.txt"))
+  
+} else {
+  txp_de <- read_tsv(file.path(projDir, "out", this.analysis, "OncotreePrimaryDisease_transcript_differential_expression_results.txt"))
+}
+
+txp_de_hits <- txp_de %>% filter(novel_surface == TRUE & logFC > 2 & FDR < 0.05)
+
+# Subset data for faster parsing
+hit_dat <- as.data.frame(expr_mat_log[which(rownames(expr_mat_log) %in% unique(txp_de_hits$transcript_id)), ]) %>%
+            rownames_to_column("transcript_id") %>%
+            pivot_longer(cols = !transcript_id, names_to = "ModelID", values_to = "log2TPM") %>%
+            left_join(select(mtdt, ModelID, OncotreePrimaryDisease, OncotreeLineage), by = "ModelID") %>%
+            left_join(select(lr_gtf, transcript_id, gene_name), by = "transcript_id") %>%
+            mutate(gene_transcript = paste(gene_name, transcript_id, sep = ": ")) %>%
+            as.data.frame()
+
+# hit_dat_gt_1 <- as.data.frame(hit_dat) %>%
+#                 rownames_to_column("transcript_id") %>%
+#                 pivot_longer(cols = !transcript_id, names_to = "ModelID", values_to = "log2TPM") %>%
+#                 left_join(select(mtdt, ModelID, OncotreeLineage, OncotreePrimaryDisease), by = "ModelID") %>% 
+#                 group_by(transcript_id, OncotreePrimaryDisease) %>%
+#                 summarise(num_models_gt_1_log2TPM = sum(log2TPM > 1, na.rm = TRUE)) %>%
+#                 ungroup() %>%
+#                 as.data.frame()
+# 
+# txp_de_hits %<>% left_join(select(hit_dat_gt_1, transcript_id, OncotreePrimaryDisease, num_models_gt_1_log2TPM), by = c("transcript_id", "OncotreePrimaryDisease")) %>%
+#                   filter(num_models_gt_1_log2TPM >= 3)
+
+```
+
+
+```{r}
+knitr::knit_exit()
+```
